@@ -1,7 +1,7 @@
-# 图书销售电商系统 需求与规范（v0.1）
+# 图书销售电商系统 需求与规范（v0.2）
 
-> 状态：初稿，待评审
-> 版本：v0.1
+> 状态：评审修订中（Q-1 ~ Q-3 已确认，Q-4 ~ Q-10 待确认）
+> 版本：v0.2
 > 日期：2026-11-16
 > 适用项目版本：0.1.0
 > 关联决策：架构方案 C（模块化单体 + 秒杀独立服务）、Java 21 / Spring Boot 3.3 / MyBatis-Plus / ShardingSphere-JDBC / Redis / Kafka / Vue 3 / Sentinel / JUnit 5 + Testcontainers / Gatling
@@ -15,6 +15,7 @@
 | 版本 | 日期 | 修改人 | 说明 |
 |---|---|---|---|
 | v0.1 | 2026-11-16 | adult-KFC | 第一版初稿，覆盖需求、架构、数据、接口、并发一致性、编码与工程规范 |
+| v0.2 | 2026-11-16 | adult-KFC | 评审 Q-1 ~ Q-3：支付模拟三模式与支付记录调整、秒杀库存改为独立账本 + 激活预占、超时关单回补规则 |
 
 ### 0.2 阅读对象
 
@@ -152,7 +153,7 @@ flowchart LR
 | `catalog` | 分类、图书、搜索、详情缓存 | `/api/v1/books/**`、`/api/v1/categories` |
 | `cart` | 购物车条目与勾选 | `/api/v1/cart/**` |
 | `order` | 订单创建、状态机、查询、取消、超时关单 | `/api/v1/orders/**` |
-| `inventory` | 库存扣减、回补、调整、库存流水 | 内部服务 + 后台接口 |
+| `inventory` | 库存扣减、回补、调整、库存流水、秒杀库存预占/释放 | 内部服务 + 后台接口 |
 | `payment` | 模拟支付单、回调、幂等处理 | `/api/v1/orders/*/pay`、`/api/v1/payments/**` |
 | `admin` | 后台聚合接口、权限校验、看板 | `/api/v1/admin/**` |
 | `common` | 统一返回、异常、错误码、幂等、审计、工具 | — |
@@ -162,6 +163,7 @@ flowchart LR
 | 能力 | 职责 |
 |---|---|
 | 活动与商品 | 秒杀活动、秒杀 SKU、限购规则 |
+| 库存预占/释放 | 激活时通过 mall-server 内部接口预占 `book_stock`，结束/停止时释放未售出库存 |
 | 库存预热 | 活动开始前将库存写入 Redis |
 | 流量闸门 | Redis Lua 原子校验与预扣 |
 | 异步下单 | 消费秒杀请求，落库扣减并发出下单事件 |
@@ -205,7 +207,7 @@ flowchart LR
 
 1. **边界清晰**：模块只通过应用服务接口或领域事件交互，不跨模块直接访问对方表。
 2. **单体优先**：非秒杀能力不拆服务，避免分布式复杂度。
-3. **缓存与消息只做加速与解耦**：数据库是普通订单与库存的最终账本；秒杀库存以 Redis 为闸门、DB 为账本。
+3. **缓存与消息只做加速与解耦**：数据库是库存的最终账本；秒杀库存从 `book_stock` 预占，Redis 只做流量闸门，避免物理库存双卖。
 4. **最终一致性**：跨服务流程使用事件与补偿，不使用跨库事务。
 5. **幂等优先**：所有写接口、消息消费者、支付回调必须幂等。
 6. **可观测**：关键链路统一 traceId、结构化日志、核心指标与告警。
@@ -304,44 +306,51 @@ stateDiagram-v2
 
 | 编号 | 需求 |
 |---|---|
-| FR-INV-01 | 每个图书维护可售库存 `stock` 与锁定库存 `locked_stock` **【假设】** |
+| FR-INV-01 | 每个图书维护可售库存 `stock`；`locked_stock` 本期不使用，秒杀预占通过扣减 `stock` 实现 |
 | FR-INV-02 | 普通下单使用数据库条件更新扣减：`stock >= quantity` 才成功 |
 | FR-INV-03 | 订单取消、超时关闭时回补库存，且只回补一次 |
 | FR-INV-04 | 管理员可调整库存，调整需记录流水（操作人、前后值、原因） |
 | FR-INV-05 | 库存不得为负；任何扣减失败必须回滚业务 |
-| FR-INV-06 | 秒杀库存与普通库存的划分方式见 9.4 **【待评审】** |
+| FR-INV-06 | 秒杀库存采用“独立账本 + 激活预占”：活动激活时从 `book_stock` 预占秒杀库存，结束/停止时释放未售出部分，见 9.4 |
+| FR-INV-07 | 预占与释放必须幂等，记录 `stock_log`（`SECKILL_RESERVE` / `SECKILL_RELEASE`）与预占记录 |
+| FR-INV-08 | 预占期间 `book_stock.stock` 不包含已预占的秒杀库存；物理库存不变量见 C-11 |
 
 ### 5.6 支付（模拟）（FR-PAY）
 
 | 编号 | 需求 |
 |---|---|
 | FR-PAY-01 | 用户对待支付订单发起模拟支付，生成支付单 |
-| FR-PAY-02 | 模拟支付支持配置成功/失败；默认成功 **【假设】** |
+| FR-PAY-02 | 模拟支付支持三种模式：`SUCCESS`（默认）、`FAIL`、`NO_CALLBACK`；仅 local/dev/staging 可启用，prod 硬禁用 |
 | FR-PAY-03 | 支付回调必须幂等：同一支付单重复回调只生效一次 |
 | FR-PAY-04 | 支付成功后订单状态由 `UNPAID` 变为 `PAID`，记录支付时间与支付单号 |
 | FR-PAY-05 | 已支付订单不可取消；重复支付直接返回已支付 |
 | FR-PAY-06 | 提供支付状态查询接口，供前端轮询 |
-| FR-PAY-07 | 模拟回调仅允许内网或测试开关启用 |
+| FR-PAY-07 | 模拟回调与模式切换仅允许内网或测试令牌调用，并记录审计日志；prod 不得暴露 |
+| FR-PAY-08 | 支付失败后订单保持 `UNPAID`、库存不变，用户可重新发起支付；每次发起生成新的 `payment_no` |
 
 ### 5.7 秒杀（FR-SECK）
 
 | 编号 | 需求 |
 |---|---|
 | FR-SECK-01 | 管理员可创建秒杀活动，配置名称、开始/结束时间、秒杀 SKU、秒杀价、库存、每人限购 |
-| FR-SECK-02 | 活动状态：`DRAFT` → `READY` → `ACTIVE` → `ENDED`，由管理员或定时任务推进 |
+| FR-SECK-02 | 活动状态：`DRAFT` → `READY` → `ACTIVE` → `STOPPING` → `ENDED`，由管理员或定时任务推进 |
 | FR-SECK-03 | 活动开始前将秒杀库存与活动元数据预热到 Redis |
 | FR-SECK-04 | 用户只能对进行中的活动下单，且满足每人限购 |
 | FR-SECK-05 | 下单入口使用 Redis Lua 原子完成：时间校验、限购校验、库存扣减、用户计数 |
 | FR-SECK-06 | 预扣成功后返回 `202 Accepted` 与 `requestId`；前端轮询结果 |
 | FR-SECK-07 | 预扣成功的请求写入 Kafka，由消费者异步创建订单 |
 | FR-SECK-08 | 同一用户对同一秒杀 SKU 只能成功下单一次（默认限购 1） |
-| FR-SECK-09 | 异步下单失败时回补 Redis 与数据库库存，并记录失败原因 |
+| FR-SECK-09 | 异步下单失败时按 9.6 的统一释放规则回补库存，并记录失败原因；释放必须幂等 |
 | FR-SECK-10 | 消费者必须幂等；重复消息不得产生重复订单 |
 | FR-SECK-11 | 活动结束后停止接受请求，并清理/归档 Redis 键 |
 | FR-SECK-12 | 提供秒杀结果查询接口（处理中/成功/失败/售罄） |
 | FR-SECK-13 | 提供对账任务，比对 Redis 售出数、请求表、订单表 |
 | FR-SECK-14 | 秒杀订单支付流程与普通订单一致 |
 | FR-SECK-15 | 秒杀入口必须接入 Sentinel 限流，超限返回 429 |
+| FR-SECK-16 | 超时关单回补规则见 9.6：活动进行中回补秒杀池，活动结束后回补 `book_stock`，均只释放一次 |
+| FR-SECK-17 | 超时关单回补库存时不回退用户限购计数；同一用户同一 SKU 仍只能有一个成功订单 |
+
+> 活动激活顺序：预占 `book_stock` → 预热 Redis → `ACTIVE`；任一步失败则释放预占并保持非 `ACTIVE`。
 
 秒杀下单时序：
 
@@ -385,7 +394,9 @@ sequenceDiagram
 - 同一 `requestId` 的查询与重试结果一致。
 - 秒杀价必须低于或等于图书原价。
 - 活动进行中禁止修改库存与价格；如需调整，先停止活动。
-- 秒杀库存预热失败时活动不得进入 `ACTIVE`。
+- 秒杀库存预占或预热失败时活动不得进入 `ACTIVE`，已预占库存必须释放。
+- 活动结束采用两步：先置 `STOPPING` 拒绝新请求并等待在途请求处理完，再置 `ENDED` 并释放未售出库存。
+- 超时关单回补库存但不回退限购计数。
 
 ### 5.8 后台管理（FR-ADM）
 
@@ -454,6 +465,7 @@ sequenceDiagram
 | NFR-SEC-07 | 敏感配置通过环境变量或密钥管理注入，不进入代码仓 |
 | NFR-SEC-08 | 依赖漏洞扫描纳入 CI |
 | NFR-SEC-09 | 测试夹具不得包含真实用户数据（项目核心约束） |
+| NFR-SEC-10 | 模拟支付、失败注入与无回调模式仅允许在 local/dev/staging 启用，prod 必须硬禁用并纳入启动自检 |
 
 ### 6.4 可观测性
 
@@ -494,11 +506,11 @@ sequenceDiagram
 | `book_category` | 分类 | id, parent_id, name, sort, status | idx(parent_id) |
 | `book` | 图书 | id, isbn, title, author, publisher, category_id, price, cover_url, description, status | uk(isbn), idx(category_id, status) |
 | `book_stock` | 库存 | book_id, stock, locked_stock, version, updated_at | pk(book_id) |
-| `stock_log` | 库存流水 | id, book_id, change_type, before, after, operator, remark | idx(book_id, created_at) |
+| `stock_log` | 库存流水 | id, book_id, change_type, before, after, ref_type, ref_id, operator, remark | idx(book_id, created_at), uk(ref_type, ref_id, change_type) |
 | `cart_item` | 购物车 | id, user_id, book_id, quantity, selected | uk(user_id, book_id) |
-| `shop_order` | 订单主表 | id, order_no, user_id, status, total_amount, pay_amount, payment_no, receiver_snapshot, created_at, paid_at, closed_at | uk(order_no), idx(user_id, status, created_at)；按 user_id 分片 |
+| `shop_order` | 订单主表 | id, order_no, user_id, status, total_amount, pay_amount, payment_no, receiver_snapshot, stock_released, created_at, paid_at, closed_at | uk(order_no), idx(user_id, status, created_at)；按 user_id 分片 |
 | `order_item` | 订单明细 | id, order_id, user_id, book_id, title_snapshot, price, quantity, subtotal | idx(order_id)；按 user_id 分片 |
-| `payment_record` | 支付单 | id, payment_no, order_no, amount, channel, status, paid_at, callback_payload | uk(payment_no), uk(order_no) |
+| `payment_record` | 支付单（每次发起一条） | id, payment_no, order_no, amount, channel, status, paid_at, callback_payload | uk(payment_no), idx(order_no, created_at) |
 | `idempotency_record` | 幂等记录 | id, idem_key, user_id, scope, request_hash, response_body, status, expires_at | uk(idem_key) |
 | `outbox_event` | 事件发件箱 | id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, next_retry_at | idx(status, next_retry_at) |
 | `audit_log` | 审计日志 | id, operator_id, action, target_type, target_id, detail, ip, created_at | idx(operator_id, created_at) |
@@ -509,8 +521,11 @@ sequenceDiagram
 |---|---|---|---|
 | `seckill_activity` | 活动 | id, name, start_time, end_time, status, created_at | idx(status, start_time) |
 | `seckill_sku` | 秒杀商品 | id, activity_id, book_id, seckill_price, stock, sold, per_user_limit, version | uk(activity_id, book_id) |
+| `seckill_reservation` | 秒杀库存预占 | id, activity_id, sku_id, book_id, reserved_quantity, released_quantity, status, created_at, updated_at | uk(activity_id, sku_id) |
 | `seckill_request` | 秒杀请求 | id, request_id, activity_id, user_id, sku_id, quantity, status, order_no, fail_reason, created_at | uk(request_id), uk(activity_id, user_id, sku_id) |
 | `seckill_reconcile_log` | 对账记录 | id, activity_id, redis_sold, db_sold, order_count, diff, created_at | idx(activity_id, created_at) |
+
+> `seckill_request` 的 `uk(activity_id, user_id, sku_id)` 保持不变：超时关单回补库存但不回退限购计数，同一用户不能重复下单。
 
 ### 7.4 Redis 设计
 
@@ -523,11 +538,13 @@ sequenceDiagram
 | `idem:{scope}:{key}` | String | 24 小时 | 接口幂等结果 |
 | `rate:{scene}:{identity}` | String/计数器 | 窗口期 | Sentinel 之外的业务限流 |
 | `lock:{scene}:{id}` | String | 30 秒 | 仅定时任务/后台调整使用 |
+| `seckill:release:{orderNo}` | String | 7 天 | 库存释放幂等标记（`SET NX`） |
 
 Redis 使用规范：
 
 - 所有键必须带业务前缀与 TTL，禁止无 TTL 的业务键。
 - 秒杀库存扣减使用 Lua 脚本，保证“校验 + 扣减 + 记用户”原子性。
+- 秒杀库存释放使用 `seckill:release:{orderNo}` 作为幂等标记，`SET NX` 成功后才执行回补。
 - 缓存更新采用“先更新数据库，再删除缓存”；删除失败进入重试队列。
 - 缓存空值防穿透，TTL 缩短；热点键设置随机过期时间防雪崩。
 
@@ -705,6 +722,10 @@ HTTP 状态码：
 | POST | `/internal/seckill/activities/{id}/preload` | 预热库存到 Redis |
 | GET | `/internal/seckill/activities/{id}/progress` | 秒杀进度 |
 | POST | `/internal/seckill/requests/{requestId}/compensate` | 补偿请求（兜底） |
+| POST | `/internal/inventory/seckill-reservations` | 预占秒杀库存（幂等，mall-server） |
+| POST | `/internal/inventory/seckill-reservations/{activityId}/{skuId}/release` | 释放预占库存（幂等，mall-server） |
+
+> `/internal/seckill/**` 由 seckill-service 提供；`/internal/inventory/**` 由 mall-server 提供。
 
 ### 8.4 幂等与重试约定
 
@@ -721,8 +742,8 @@ HTTP 状态码：
 
 | 编号 | 不变量 |
 |---|---|
-| C-1 | 任何时刻 `book_stock.stock >= 0`、`seckill_sku.stock >= 0` |
-| C-2 | 秒杀成功订单数 ≤ 活动可售库存 |
+| C-1 | 任何时刻 `book_stock.stock >= 0`、`seckill_sku.stock >= 0`、`seckill_sku.sold >= 0` |
+| C-2 | 同一时刻未关闭的秒杀订单数 ≤ 活动可售库存；已关闭/失败的订单不占用库存 |
 | C-3 | 同一用户对同一秒杀 SKU 最多一个成功订单 |
 | C-4 | 同一 `Idempotency-Key` 只产生一次业务副作用 |
 | C-5 | 同一支付单重复回调只改变一次订单状态 |
@@ -731,6 +752,8 @@ HTTP 状态码：
 | C-8 | 库存回补只发生一次，且必须对应一次有效的取消/关闭 |
 | C-9 | 订单状态只能按状态机流转 |
 | C-10 | 消息至少投递一次，消费者按业务唯一键去重 |
+| C-11 | 对任意图书，`book_stock.stock + Σ seckill_sku.stock + Σ seckill_sku.sold + 普通销售已扣减数量 = 初始总库存`；预占、释放、秒杀成交只做账本间转移，不改变总量 |
+| C-12 | 秒杀库存预占、释放（取消/超时/异步失败）各只发生一次；释放后不得重复回补 |
 
 ### 9.2 普通下单事务
 
@@ -756,6 +779,7 @@ HTTP 状态码：
 | 普通下单 | 数据库条件更新，强一致 |
 | 取消/超时关单 | 条件更新回补 + 唯一回补标记，防重复 |
 | 后台调整 | 行锁或乐观锁，记录流水 |
+| 秒杀激活/结束 | 预占/释放 `book_stock`，幂等 + `stock_log` |
 | 秒杀下单 | Redis Lua 预扣 + DB 条件扣减（见 9.4） |
 
 防超卖的三道防线：
@@ -766,56 +790,65 @@ HTTP 状态码：
 
 ### 9.4 秒杀一致性设计
 
-**库存模型【待评审】**
+**库存模型（已确认：独立账本 + 激活预占）**
 
-本期采用“秒杀独立库存”：
+秒杀库存不共享 `book_stock` 的实时账本，但必须从 `book_stock` 预占，避免同一批物理库存被普通销售和秒杀重复卖出：
 
-- `seckill_sku.stock` 是秒杀专属库存，不从 `book_stock` 扣减。
-- 活动创建时由管理员指定秒杀库存，并校验不超过图书总库存。
-- 普通销售与秒杀销售分别记账；看板合并展示。
-- 若评审选择“共享库存”，则需要在秒杀确认时同步扣减 `book_stock`，复杂度更高。
+- 活动激活时，秒杀服务通过 mall-server 内部接口按 SKU 预占库存；mall-server 以条件更新扣减 `book_stock.stock`，写 `stock_log`（`SECKILL_RESERVE`）和 `seckill_reservation`（`RESERVED`）。
+- 预占成功后，秒杀服务再预热 Redis；预占或预热任一步失败，活动不得进入 `ACTIVE`，并释放已预占库存。
+- 活动结束/停止时，释放未售出的 `seckill_sku.stock` 回 `book_stock`，写 `SECKILL_RELEASE`；已售出部分不回补。
+- 秒杀流程中 Redis 仍是闸门，DB 的 `seckill_sku` 是秒杀账本，`book_stock` 是物理库存总账本。
+- 预占通过扣减 `book_stock.stock` 实现（不使用 `locked_stock`）；预占与释放以 `(activity_id, sku_id)` 幂等，重复调用不得重复扣减或回补。
 
 **处理流程**
 
-1. **预热**：活动进入 `ACTIVE` 前，将 `stock`、`per_user_limit`、起止时间写入 Redis。
-2. **闸门**：`POST .../orders` 执行 Lua：
+1. **预占**：活动激活前，按 SKU 调 `/internal/inventory/seckill-reservations` 预占 `book_stock`；幂等键 `(activity_id, sku_id)`。
+2. **预热**：预占成功后，将 `stock`、`per_user_limit`、起止时间写入 Redis；失败则释放预占。
+3. **闸门**：`POST .../orders` 执行 Lua：
    - 校验活动时间与状态；
    - 校验用户已购数量 < 限购；
    - 校验并扣减 Redis 库存；
    - 用户计数 +1；
    - 返回成功或具体失败原因。
-3. **落请求**：预扣成功后写 `seckill_request`（PENDING），唯一键 `(activity_id, user_id, sku_id)` 防重复。
-4. **异步下单**：发送 `seckill.order.request`；消费者执行：
+4. **落请求**：预扣成功后写 `seckill_request`（PENDING），唯一键 `(activity_id, user_id, sku_id)` 防重复。
+5. **异步下单**：发送 `seckill.order.request`；消费者执行：
    - 以 `request_id` 幂等检查；
    - 条件更新 `seckill_sku`：`stock = stock - 1 AND stock >= 1`；
    - 成功则标记 `CREATED`，发送 `seckill.order.created`；
-   - 失败则标记 `FAILED`，回补 Redis，并记录原因。
-5. **统一订单**：mall order 模块消费 `seckill.order.created`，以 `requestId` 幂等创建 `shop_order`（状态 `UNPAID`）。
-6. **失败补偿**：若统一订单创建失败，发送 `seckill.order.compensate`；秒杀服务回补 Redis 与 DB 库存，标记 `FAILED`。
-7. **支付**：用户对秒杀订单发起支付，流程与普通订单相同；超时未支付则关单，是否回补秒杀库存见 9.6。
+   - 失败则标记 `FAILED`，按 9.6 释放 Redis/DB 库存，并记录原因。
+6. **统一订单**：mall order 模块消费 `seckill.order.created`，以 `requestId` 幂等创建 `shop_order`（状态 `UNPAID`）。
+7. **失败补偿**：若统一订单创建失败，发送 `seckill.order.compensate`；秒杀服务按 9.6 释放库存，标记 `FAILED`。
+8. **支付与超时**：用户对秒杀订单发起支付，流程与普通订单相同；超时未支付则按 9.6 关单并释放库存。
 
 **关键约束**
 
-- Redis 库存是“闸门”，可以比 DB 账本更早失败，但不得比 DB 更宽松。
-- 任何回补都必须幂等：以 `requestId` + 状态机条件更新，防止重复回补。
-- 秒杀请求表、订单表、Redis 计数三者的差异由对账任务发现，不依赖人工盯盘。
+- `book_stock` 是物理库存唯一账本；Redis 是闸门，`seckill_sku` 是秒杀账本。
+- 预占、释放都必须幂等：以 `(activity_id, sku_id)` / `orderNo` + 状态机条件更新，防止重复扣减或回补。
+- 活动结束只释放未售出的秒杀库存；已售出但未支付的订单，其库存在超时关单时释放。
+- 秒杀请求表、预占记录、订单表、Redis 计数四者的差异由对账任务发现，不依赖人工盯盘。
 
 ### 9.5 支付回调幂等
 
-- `payment_record.payment_no` 唯一。
-- 回调处理：`UPDATE payment_record SET status='PAID' WHERE payment_no=? AND status='PENDING'`，影响行数为 0 说明已处理，直接返回成功。
-- 订单状态更新同样使用条件更新：`UPDATE shop_order SET status='PAID' WHERE order_no=? AND status='UNPAID'`。
-- 两步在同一本地事务内；重复回调不产生额外副作用。
+- `payment_record.payment_no` 唯一；`status` 取值：`PENDING` / `PAID` / `FAILED` / `EXCEPTION`。
+- `shop_order.payment_no` 仅在支付成功时写入；失败的支付尝试只保留在 `payment_record`，不影响订单。
+- 回调处理先校验订单状态：
+  - 订单为 `UNPAID`：`UPDATE payment_record SET status='PAID' WHERE payment_no=? AND status='PENDING'`，再 `UPDATE shop_order SET status='PAID', payment_no=? WHERE order_no=? AND status='UNPAID'`，两步在同一本地事务内。
+  - 订单为 `CLOSED` / `CANCELLED`：`payment_record` 标记 `EXCEPTION` 并告警，不修改订单（退款在范围外）。
+- 影响行数为 0 说明重复回调或状态冲突，按幂等规则返回；重复回调不产生额外副作用。
 
 ### 9.6 超时关单与库存释放
 
 - 定时任务每 1 分钟扫描 `status='UNPAID' AND created_at < now() - 30min` 的订单。
 - 使用 `SELECT ... FOR UPDATE SKIP LOCKED` 或条件更新抢占，避免多实例重复处理。
-- 关单与回补库存在同一事务；回补使用幂等标记 `stock_released=true` 或流水唯一键。
-- 秒杀订单超时关闭时，是否回补秒杀库存 **【待定】**：
-  - 方案 A：不回补（秒杀库存视为已消耗）；
-  - 方案 B：回补 Redis 与 `seckill_sku`，允许他人购买。
-  - 初稿建议方案 B，回补动作必须幂等并记录对账日志。
+- 普通订单的关单与 `book_stock` 回补在同一本地事务；秒杀订单的关单与 `stock_released` 标记在 mall-server 本地事务，秒杀池/Redis 释放通过事件或内部调用完成，允许最终一致，以释放标记和对账保证不重复。
+- 秒杀订单超时关闭时回补库存（已确认方案 B），规则如下：
+  - **活动进行中且未到结束时间**：回补 Redis 与 `seckill_sku.stock`，`sold` 减 1；使用 `seckill:release:{orderNo}`（`SET NX`）保证只回补一次。
+  - **活动已结束**：不回补 Redis，不复活 `seckill_sku`；将库存回补到 `book_stock`，写 `SECKILL_RELEASE` 流水。活动结束时只释放未售出的 `seckill_sku.stock`，已售出但未支付的库存在超时关单时再释放。
+  - **限购计数**：不回退 Redis 用户计数；同一用户同一 SKU 仍只能有一个成功订单（`seckill_request` 唯一键不变）。
+  - **释放幂等**：统一调用 `releaseStock(orderNo, reason)`；以 `shop_order.stock_released=0 → 1` 的条件更新 + 状态 `UNPAID → CLOSED` 抢占，只有抢占成功者执行回补。异步下单失败发生在订单创建前，由 `seckill_request` 状态机保证只释放一次。
+  - **支付竞态**：关单使用 `UPDATE shop_order SET status='CLOSED' WHERE order_no=? AND status='UNPAID'`；影响行数为 0 则跳过回补。关单后到达的支付回调返回业务错误，不修改订单。
+  - 活动结束释放前必须先置 `STOPPING` 停止接单，并等待在途 `seckill.order.request` 处理完或失败，再置 `ENDED`；避免释放后又被在途请求扣减。
+  - 回补动作必须记录对账日志，纳入 AC-F-07 / AC-P-04 验收。
 
 ### 9.7 分布式锁使用规范
 
@@ -1003,6 +1036,7 @@ modules/<module>/
 
 - 配置通过环境变量注入；仓库只保留 `.env.example`。
 - 不同环境使用 Spring Profile：`local`、`dev`、`staging`、`prod`。
+- 模拟支付/失败注入仅在 `local`、`dev`、`staging` 启用；`prod` 启动时校验必须关闭。
 - 密钥使用环境变量或密钥管理服务，禁止写入配置文件。
 
 ### 11.4 数据库变更
@@ -1043,6 +1077,7 @@ Gatling 场景：
 - 无超卖：`sold <= stock`，订单数 ≤ 库存。
 - 无重复订单：同一用户同一 SKU 成功订单数 ≤ 1。
 - 异步订单在 5 秒内可查。
+- 超时关单回补只发生一次；活动结束与超时释放不重复回补。
 - 压测后对账差异为 0。
 
 ### 11.7 监控与告警
@@ -1071,13 +1106,15 @@ Gatling 场景：
 | AC-F-03 | 加购、改数量、删除、勾选、合计正确 |
 | AC-F-04 | 下单成功扣库存，库存不足下单失败且不产生订单 |
 | AC-F-05 | 取消订单回补库存，重复取消不重复回补 |
-| AC-F-06 | 模拟支付成功订单变为已支付；重复回调无副作用 |
-| AC-F-07 | 超时关单自动执行且只执行一次 |
+| AC-F-06 | 模拟支付成功/失败/无回调三模式可用；失败后订单保持待支付且库存不变；重复回调无副作用 |
+| AC-F-07 | 普通与秒杀订单超时关单自动执行且只执行一次；秒杀订单按 9.6 回补库存且不重复回补 |
 | AC-F-08 | 秒杀活动可创建、预热、启动、停止 |
 | AC-F-09 | 秒杀下单返回 202，结果可查询，订单可支付 |
 | AC-F-10 | 秒杀售罄、未开始、超限购返回明确错误 |
 | AC-F-11 | 后台图书、库存、订单、用户、活动管理可用 |
 | AC-F-12 | 后台操作有审计日志 |
+| AC-F-13 | 秒杀活动激活时成功预占 `book_stock`；预占或预热失败不得进入 `ACTIVE`；结束后未售出库存回补 |
+| AC-F-14 | 支付重试生成新的 `payment_no`，历史支付记录可查询 |
 
 ### 12.2 性能与一致性验收
 
@@ -1090,6 +1127,8 @@ Gatling 场景：
 | AC-P-05 | 普通下单 500 QPS 下库存一致 |
 | AC-P-06 | 重复 `Idempotency-Key` 请求返回同一结果 |
 | AC-P-07 | 重复支付回调不产生重复状态变更 |
+| AC-P-08 | 秒杀预占/释放后物理库存不变量 C-11 成立 |
+| AC-P-09 | 活动结束与超时关单并发时，库存不重复回补、不为负 |
 
 ### 12.3 安全与工程质量验收
 
@@ -1101,6 +1140,7 @@ Gatling 场景：
 | AC-S-04 | 仓库无密钥、无真实用户数据 |
 | AC-S-05 | CI 全绿，核心模块覆盖率达标 |
 | AC-S-06 | 接口文档可访问且与实现一致 |
+| AC-S-07 | 生产 Profile 下模拟支付与失败注入接口不可用 |
 
 ### 12.4 交付物
 
@@ -1117,7 +1157,7 @@ Gatling 场景：
 
 | 阶段 | 内容 | 退出标准 |
 |---|---|---|
-| M0 评审 | 本文档评审与修订 | 关键待定项确认，文档定稿 v1.0 |
+| M0 评审 | 本文档评审与修订 | Q-1 ~ Q-3 已确认；Q-4 ~ Q-10 确认后文档定稿 v1.0 |
 | M1 脚手架 | 后端/前端工程、Docker Compose、Flyway、CI | 本地一键启动，CI 跑通空测试 |
 | M2 基础域 | 用户、认证、图书、分类、购物车、后台图书管理 | 浏览与加购闭环可用 |
 | M3 交易域 | 订单、库存、模拟支付、超时关单、后台订单 | 下单支付闭环可用，库存一致 |
@@ -1133,21 +1173,21 @@ Gatling 场景：
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 秒杀库存模型（独立 vs 共享）未定 | 数据模型与流程返工 | M0 评审确认，本文档按独立库存设计 |
+| 秒杀库存预占/释放跨服务 | 预占失败或重复释放导致库存不一致 | 以 `(activity_id, sku_id)` 幂等，异常补偿 + 对账；已确认独立账本 + 激活预占 |
 | 本机网络不稳定导致依赖/镜像拉取慢 | 开发效率 | 使用镜像源与本地缓存 |
 | 10,000 QPS 压测环境资源不足 | 性能结论不可信 | 压测前评估 CPU/内存/网络，必要时分阶段加压 |
 | Kafka/Redis 单点故障 | 秒杀不可用 | 生产多副本；开发环境接受单点 |
 | 分片键选择不当 | 后台查询性能差 | 评审分片键；必要时增加查询库 |
-| 秒杀订单超时关单是否回补未定 | 库存口径不一致 | 评审确认方案 A/B |
+| 秒杀超时关单与活动结束并发释放 | 库存重复回补或口径不一致 | 统一 `releaseStock` + 订单状态条件更新 + Redis NX；已确认回补方案 B |
 | 范围蔓延（优惠券、评价等） | 延期 | 严格按第 2 章范围执行，新需求走变更 |
 
 ### 14.2 待确认问题
 
 | 编号 | 问题 | 初稿建议 |
 |---|---|---|
-| Q-1 | 支付模拟是否支持失败注入？ | 支持测试开关，默认成功 |
-| Q-2 | 秒杀库存与普通库存是否共享？ | 独立库存，便于压测与对账 |
-| Q-3 | 秒杀订单超时关闭是否回补库存？ | 回补，且幂等 |
+| Q-1 | 支付模拟是否支持失败注入？ | **已确认**：支持 `SUCCESS` / `FAIL` / `NO_CALLBACK`，仅测试环境；`payment_record` 改为多次支付记录 |
+| Q-2 | 秒杀库存与普通库存是否共享？ | **已确认**：独立账本 + 激活预占 + 结束释放 |
+| Q-3 | 秒杀订单超时关闭是否回补库存？ | **已确认**：回补；活动进行中回秒杀池，结束后回 `book_stock`，幂等且不回退限购计数 |
 | Q-4 | 登录方式是否包含手机号/验证码？ | 本期仅用户名/邮箱 + 密码 |
 | Q-5 | 后台是否需要多角色 RBAC？ | 本期单 ADMIN，预留权限字段 |
 | Q-6 | 订单分片键用 `user_id` 还是 `order_no`？ | `user_id`，后台查询走广播/查询库 |
@@ -1165,6 +1205,7 @@ Gatling 场景：
 - 架构方案 C：2026-11-15 决策记录。
 - 技术栈（Java 21、Spring Boot 3.3、MyBatis-Plus、ShardingSphere-JDBC、Redis、Kafka、Vue 3）：2026-11-15 决策记录。
 - Sentinel、JUnit 5 + Testcontainers、Gatling：2026-11-16 决策记录。
+- 2026-11-16 评审确认：Q-1 支付模拟三模式与支付记录调整；Q-2 秒杀独立账本 + 激活预占；Q-3 超时关单回补。
 - 峰值下单 QPS 1w、秒杀为必须场景：2026-11-15 需求确认。
 - 禁止提交真实用户数据到测试夹具：项目核心约束。
 
