@@ -1,7 +1,7 @@
-# 图书销售电商系统 需求与规范（v0.2）
+# 图书销售电商系统 需求与规范（v0.3）
 
-> 状态：评审修订中（Q-1 ~ Q-3 已确认，Q-4 ~ Q-10 待确认）
-> 版本：v0.2
+> 状态：评审修订中（Q-1 ~ Q-4 已确认，Q-5 ~ Q-10 待确认）
+> 版本：v0.3
 > 日期：2026-11-16
 > 适用项目版本：0.1.0
 > 关联决策：架构方案 C（模块化单体 + 秒杀独立服务）、Java 21 / Spring Boot 3.3 / MyBatis-Plus / ShardingSphere-JDBC / Redis / Kafka / Vue 3 / Sentinel / JUnit 5 + Testcontainers / Gatling
@@ -16,6 +16,7 @@
 |---|---|---|---|
 | v0.1 | 2026-11-16 | adult-KFC | 第一版初稿，覆盖需求、架构、数据、接口、并发一致性、编码与工程规范 |
 | v0.2 | 2026-11-16 | adult-KFC | 评审 Q-1 ~ Q-3：支付模拟三模式与支付记录调整、秒杀库存改为独立账本 + 激活预占、超时关单回补规则 |
+| v0.3 | 2026-11-16 | adult-KFC | 评审 Q-4：确认用户名/邮箱 + 密码登录；补齐邮箱验证链接、标识符规范化、邮箱未验证限制与密码找回规则 |
 
 ### 0.2 阅读对象
 
@@ -77,7 +78,7 @@
 - 商品评价、晒单、问答
 - 物流轨迹、多仓发货
 - Elasticsearch 搜索、个性化推荐
-- 短信/邮件验证码、第三方登录
+- 短信验证码、第三方登录（邮件验证链接属于本期认证流程，但不发送邮件验证码）
 - 多语言、多币种
 - 生产级 Kubernetes 编排（提供可选方案，不作为本期验收项）
 
@@ -220,18 +221,25 @@ flowchart LR
 
 | 编号 | 需求 |
 |---|---|
-| FR-AUTH-01 | 用户可用用户名、邮箱、密码注册；用户名与邮箱唯一 |
+| FR-AUTH-01 | 用户可用用户名、邮箱、密码注册；用户名唯一（大小写不敏感），邮箱可选且标准化后唯一 |
 | FR-AUTH-02 | 密码使用 BCrypt 存储，禁止明文与可逆加密 |
 | FR-AUTH-03 | 登录成功返回 Access Token（JWT，2 小时）与 Refresh Token（7 天）**【假设】** |
 | FR-AUTH-04 | 支持刷新令牌与退出登录（令牌加入黑名单或短 TTL 策略） |
-| FR-AUTH-05 | 用户可查看、修改昵称与头像；邮箱修改需重新验证 **【假设】** |
+| FR-AUTH-05 | 用户可查看、修改昵称与头像；修改邮箱需校验当前密码，并向新邮箱发送验证链接，验证通过后生效 |
 | FR-AUTH-06 | 用户可维护多个收货地址，支持设置默认地址 |
 | FR-AUTH-07 | 登录失败需限流；连续失败 5 次锁定 15 分钟 **【假设】** |
 | FR-AUTH-08 | 后台账号与前台账号隔离，管理员登录走独立入口 |
+| FR-AUTH-09 | 登录使用单一 `identifier` 字段：含 `@` 按邮箱登录，否则按用户名登录；登录失败统一返回“用户名/邮箱或密码错误”，防止账号枚举 |
+| FR-AUTH-10 | 注册后向邮箱发送一次性验证链接（24 小时有效）；未验证邮箱不得用于登录或找回密码 |
+| FR-AUTH-11 | 密码找回仅对已验证邮箱开放：发送一次性重置链接（30 分钟有效），重置成功后撤销该用户全部刷新令牌 |
+| FR-AUTH-12 | 未验证邮箱或无邮箱的用户由管理员重置密码，记录审计日志 |
 
 业务规则：
 
-- 用户名长度 3–32，密码长度 8–64，需包含字母与数字。
+- 用户名长度 3–32，仅允许 `[A-Za-z0-9_-]`，**禁止 `@`**；大小写不敏感唯一；存储原值并提供 `username_normalized` 唯一键。
+- 邮箱注册时可选；`trim` 并转小写后存储，提供 `email_normalized` 唯一键；格式非法直接拒绝。
+- 邮箱验证链接与密码重置令牌必须随机生成、仅存哈希、一次性使用、带有效期；重置后旧令牌立即失效。
+- 密码长度 8–64，需包含字母与数字。
 - 收货地址包含收货人、手机号、省/市/区、详细地址、是否默认。
 - 不允许删除已被未完成订单引用的地址；下单时对地址做快照。
 
@@ -466,6 +474,8 @@ sequenceDiagram
 | NFR-SEC-08 | 依赖漏洞扫描纳入 CI |
 | NFR-SEC-09 | 测试夹具不得包含真实用户数据（项目核心约束） |
 | NFR-SEC-10 | 模拟支付、失败注入与无回调模式仅允许在 local/dev/staging 启用，prod 必须硬禁用并纳入启动自检 |
+| NFR-SEC-11 | 邮箱验证与密码重置令牌必须随机、哈希存储、一次性、带有效期；重置成功后撤销全部刷新令牌 |
+| NFR-SEC-12 | 登录失败提示统一，不区分账号不存在与密码错误；登录限流按 `identifier + IP` 双维度 |
 
 ### 6.4 可观测性
 
@@ -501,7 +511,7 @@ sequenceDiagram
 
 | 表 | 用途 | 关键字段 | 关键索引/约束 |
 |---|---|---|---|
-| `sys_user` | 用户 | id, username, email, password_hash, status | uk(username), uk(email) |
+| `sys_user` | 用户 | id, username, username_normalized, email, email_normalized, email_verified_at, password_hash, status | uk(username_normalized), uk(email_normalized) |
 | `user_address` | 收货地址 | id, user_id, receiver, phone, region, detail, is_default | idx(user_id) |
 | `book_category` | 分类 | id, parent_id, name, sort, status | idx(parent_id) |
 | `book` | 图书 | id, isbn, title, author, publisher, category_id, price, cover_url, description, status | uk(isbn), idx(category_id, status) |
@@ -652,6 +662,8 @@ HTTP 状态码：
 | 60005 | 支付失败 |
 | 60006 | 幂等键冲突 |
 | 60007 | 秒杀已售罄 |
+| 60008 | 邮箱未验证，暂不可用于登录或找回密码 |
+| 60009 | 验证/重置令牌无效或已过期 |
 
 ### 8.3 接口清单
 
@@ -659,10 +671,13 @@ HTTP 状态码：
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| POST | `/api/v1/auth/register` | 否 | 注册 |
-| POST | `/api/v1/auth/login` | 否 | 登录 |
+| POST | `/api/v1/auth/register` | 否 | 注册（可附带邮箱，注册后发送验证链接） |
+| POST | `/api/v1/auth/login` | 否 | 登录（`identifier` 为用户名或邮箱） |
 | POST | `/api/v1/auth/refresh` | 否 | 刷新令牌 |
 | POST | `/api/v1/auth/logout` | 是 | 退出 |
+| POST | `/api/v1/auth/verify-email` | 否 | 使用邮件中的一次性令牌验证邮箱 |
+| POST | `/api/v1/auth/forgot-password` | 否 | 向已验证邮箱发送重置链接 |
+| POST | `/api/v1/auth/reset-password` | 否 | 使用一次性令牌重置密码 |
 | GET | `/api/v1/users/me` | 是 | 当前用户 |
 | PUT | `/api/v1/users/me` | 是 | 修改资料 |
 | GET/POST/PUT/DELETE | `/api/v1/users/me/addresses` | 是 | 地址管理 |
@@ -1157,7 +1172,7 @@ Gatling 场景：
 
 | 阶段 | 内容 | 退出标准 |
 |---|---|---|
-| M0 评审 | 本文档评审与修订 | Q-1 ~ Q-3 已确认；Q-4 ~ Q-10 确认后文档定稿 v1.0 |
+| M0 评审 | 本文档评审与修订 | Q-1 ~ Q-4 已确认；Q-5 ~ Q-10 确认后文档定稿 v1.0 |
 | M1 脚手架 | 后端/前端工程、Docker Compose、Flyway、CI | 本地一键启动，CI 跑通空测试 |
 | M2 基础域 | 用户、认证、图书、分类、购物车、后台图书管理 | 浏览与加购闭环可用 |
 | M3 交易域 | 订单、库存、模拟支付、超时关单、后台订单 | 下单支付闭环可用，库存一致 |
@@ -1188,7 +1203,7 @@ Gatling 场景：
 | Q-1 | 支付模拟是否支持失败注入？ | **已确认**：支持 `SUCCESS` / `FAIL` / `NO_CALLBACK`，仅测试环境；`payment_record` 改为多次支付记录 |
 | Q-2 | 秒杀库存与普通库存是否共享？ | **已确认**：独立账本 + 激活预占 + 结束释放 |
 | Q-3 | 秒杀订单超时关闭是否回补库存？ | **已确认**：回补；活动进行中回秒杀池，结束后回 `book_stock`，幂等且不回退限购计数 |
-| Q-4 | 登录方式是否包含手机号/验证码？ | 本期仅用户名/邮箱 + 密码 |
+| Q-4 | 登录方式是否包含手机号/验证码？ | **已确认**：用户名/邮箱 + 密码，无手机号/短信验证码；邮箱需验证链接后方可用于登录与找回；标识符做小写/去空格规范化；密码找回仅限已验证邮箱，管理员可重置兜底 |
 | Q-5 | 后台是否需要多角色 RBAC？ | 本期单 ADMIN，预留权限字段 |
 | Q-6 | 订单分片键用 `user_id` 还是 `order_no`？ | `user_id`，后台查询走广播/查询库 |
 | Q-7 | 商城 UI 组件库选型？ | 后台 Element Plus；商城自定义响应式组件 |
